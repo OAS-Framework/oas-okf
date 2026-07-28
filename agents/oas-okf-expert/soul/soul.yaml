@@ -1,0 +1,8 @@
+name: oas-okf-expert
+kind: persistent
+description: Owner of the official oas.okf package: vision, implementation, maintenance, releases, support, and OKF expertise
+type: package-maintainers
+repo: /Users/pepe-reyero/oas-workspace/oas-okf
+work: worktree
+runtime: claude
+model: opus
