@@ -26,6 +26,19 @@ const readJson = (path, at) => {
   try { return JSON.parse(readFileSync(path, "utf8")); }
   catch (error) { report(at ?? relative(root, path), `invalid JSON (${error.message})`); return undefined; }
 };
+/** A manifest root must be a JSON OBJECT. `null`, scalars and arrays are all
+ * valid JSON, and the released loader rejects them explicitly — so they must be
+ * reported here rather than falling through as "nothing left to check", which
+ * would let an empty or hostile manifest pass the gate. `undefined` means the
+ * parse already reported. */
+const objectRoot = (value, at) => {
+  if (value === undefined) return undefined;
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    report(at, `must be a JSON object (got ${value === null ? "null" : Array.isArray(value) ? "array" : typeof value})`);
+    return undefined;
+  }
+  return value;
+};
 
 // ---------- JSON Schema subset ----------
 // Enough of draft 2020-12 to evaluate the vendored schemas verbatim: local
@@ -209,11 +222,12 @@ const belowMinimum = (floor) => {
 // ---------- gate ----------
 const packagePath = join(root, "oas-package.json");
 const packageManifest = existsSync(packagePath)
-  ? readJson(packagePath, "oas-package.json")
+  ? objectRoot(readJson(packagePath, "oas-package.json"), "oas-package.json")
   : (report("oas-package.json", "distribution manifest is missing"), undefined);
-const packageSchema = readJson(join(repoRoot, "schemas", "oas-package.schema.json"), "schemas/oas-package.schema.json");
-const capabilitySchema = readJson(join(repoRoot, "schemas", "capability-manifest.schema.json"), "schemas/capability-manifest.schema.json");
-const configSchema = readJson(join(repoRoot, "schemas", "oas-config.schema.json"), "schemas/oas-config.schema.json");
+const schemaAt = (name) => objectRoot(readJson(join(repoRoot, "schemas", name), `schemas/${name}`), `schemas/${name}`);
+const packageSchema = schemaAt("oas-package.schema.json");
+const capabilitySchema = schemaAt("capability-manifest.schema.json");
+const configSchema = schemaAt("oas-config.schema.json");
 
 if (packageManifest && packageSchema) validateSchema(packageManifest, packageSchema, "oas-package.json");
 
@@ -236,7 +250,7 @@ for (const [index, capabilityDir] of declaredCapabilities.entries()) {
   if (!containedResource(root, capabilityDir, at, "capability directory")) continue;
   const manifestPath = join(root, capabilityDir, "oas.json");
   if (!existsSync(manifestPath)) { report(at, `${capabilityDir} has no oas.json (not a capability)`); continue; }
-  const manifest = readJson(manifestPath, `${capabilityDir}/oas.json`);
+  const manifest = objectRoot(readJson(manifestPath, `${capabilityDir}/oas.json`), `${capabilityDir}/oas.json`);
   if (!manifest) continue;
   capabilities.push({ rel: capabilityDir, dir: dirname(manifestPath), manifest });
   if (capabilitySchema) validateSchema(manifest, capabilitySchema, `${capabilityDir}/oas.json`);

@@ -119,12 +119,28 @@ function harvestSpawnArgs({ slug, parent, repo, work, workDir, branch, model }) 
   return args;
 }
 
-/** True when `<home>/work` is this instance's OWN tree rather than a link into
- * another instance's (attached work mode). Compared through realpath on both
- * sides, since the home itself may be reached through a symlink. */
-function ownsWorkTree(home, workDir) {
-  try { return workDir === join(realpathSync(home), "work"); }
-  catch { return false; }
+/** Who the harvester must be anchored to for an ATTACHED spawn.
+ *
+ * The kernel makes an attached agent a child of the WORK-TREE OWNER, so the
+ * anchor is decided by the source instance's recorded WORK MODE, never by the
+ * shape of `<home>/work` on disk — checkout mode symlinks that path to the
+ * repository, and workspace mode to the team scope, so "is it a symlink" says
+ * nothing about ownership.
+ *
+ * - source in ATTACHED mode: it is a guest; the tree belongs to the instance the
+ *   kernel recorded as its parent. Naming that owner is accepted for a tree the
+ *   kernel can already identify, and REQUIRED for one it cannot (a tree that is
+ *   no instance's `<home>/work` has no inferable owner).
+ * - any other mode: the source owns its tree and is the anchor itself.
+ *
+ * Returns `undefined` only when an attached source has no recorded owner — then
+ * omitting the flag lets the kernel infer a known owner, and fail explicitly if
+ * it cannot, rather than inventing a lineage. */
+function attachedAnchor(inst, meta) {
+  const mode = process.env.OAS_WORK || meta.work || "";
+  if (mode !== "attached") return inst;
+  const owner = meta.parentInstance;
+  return owner && String(owner).trim() ? owner : undefined;
 }
 
 /** Append a one-line entry to an OKF log.md (newest-first, date-grouped per spec §7). */
@@ -273,11 +289,10 @@ _(the single next action — keep this current; a fresh session on any model res
     // resolved-config read crosses the public package boundary.
     const harvestModel = settings["harvest-model"] || DEFAULT_HARVEST_MODEL;
     const workDir = realpathSync(join(home, "work"));
-    // Attached harvests inherit the source instance's tree. When the source
-    // OWNS that tree it is the harvester's parent; when the source is itself an
-    // attached guest, the tree belongs to another instance and only the kernel
-    // can name it (see harvestSpawnArgs).
-    const attachedParent = ownsWorkTree(home, workDir) ? inst : undefined;
+    // Attached harvests inherit the source instance's tree, so the harvester is
+    // a child of that tree's owner — which is the source itself unless the
+    // source is an attached guest (see attachedAnchor).
+    const attachedParent = attachedAnchor(inst, meta);
     const realSoul = realpathSync(sDir);
     const harvName = `memory-harvest-${slug}`;
     const gitRootOf = (start) => { let d = start; while (d !== dirname(d)) { if (existsSync(join(d, ".git"))) return d; d = dirname(d); } return undefined; };

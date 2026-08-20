@@ -62,7 +62,11 @@ console.log(JSON.stringify({ schemaVersion: 1, ok: true, result: {
   return bin;
 }
 
-function harvestFixture(t, mode, { model, errorCode, guestOf } = {}) {
+/** `workMode` is the source instance's RECORDED mode, `guestOf` the owner the
+ * kernel recorded for an attached source. `linkWorkTo` makes <home>/work a
+ * symlink (checkout and workspace modes do this for trees the instance owns —
+ * which is why disk shape must not decide ownership). */
+function harvestFixture(t, mode, { model, errorCode, workMode, guestOf, linkWorkTo } = {}) {
   const scope = tempDir(t);
   const root = join(scope, "agents");
   const home = join(root, "source", "instances", "source-instance-1");
@@ -70,13 +74,19 @@ function harvestFixture(t, mode, { model, errorCode, guestOf } = {}) {
   const work = join(home, "work");
   mkdirSync(join(home, "notes"), { recursive: true });
   mkdirSync(context, { recursive: true });
-  if (guestOf) {
-    // Attached work mode: <home>/work is a LINK into another instance's tree,
-    // which that instance — not this one — owns.
-    const ownerWork = join(root, "source", "instances", guestOf, "work");
-    mkdirSync(ownerWork, { recursive: true });
-    symlinkSync(ownerWork, work);
-  } else mkdirSync(work, { recursive: true });
+  const linkTarget = linkWorkTo === "owner" && guestOf
+    ? join(root, "source", "instances", guestOf, "work")
+    : linkWorkTo === "repo" ? join(scope, "checkout-repo")
+    : undefined;
+  if (linkTarget) { mkdirSync(linkTarget, { recursive: true }); symlinkSync(linkTarget, work); }
+  else mkdirSync(work, { recursive: true });
+  writeFileSync(join(home, "instance.json"), JSON.stringify({
+    instance: "source-instance-1",
+    agent: "source",
+    repo: context,
+    work: workMode || (mode === "workspace" ? "workspace" : "worktree"),
+    ...(guestOf ? { parentInstance: guestOf } : {}),
+  }, null, 2) + "\n");
   writeFileSync(join(home, "notes", "pending.md"), "---\ntype: Lesson\n---\n\nPending.\n");
 
   let soul = join(home, "soul");
@@ -102,7 +112,7 @@ function harvestFixture(t, mode, { model, errorCode, guestOf } = {}) {
       OAS_SOUL: soul,
       OAS_CONTEXT: context,
       OAS_KIND: mode === "local" ? "local" : "persistent",
-      OAS_WORK: mode === "workspace" ? "workspace" : "worktree",
+      OAS_WORK: workMode || (mode === "workspace" ? "workspace" : "worktree"),
       OAS_SETTINGS: JSON.stringify(model ? { "harvest-model": model } : {}),
       OAS_TEST_RECORD: record,
       OAS_CLI_BIN: join(fakeOasPath(t), "oas"),
@@ -259,30 +269,57 @@ test("repo-resident harvest builds an attached same-tree spawn", async (t) => {
   assert.equal(existsSync(record.taskFile), false);
 });
 
-test("an attached guest instance claims no parentage it does not have", async (t) => {
-  // The source instance shares another instance's work tree. `--parent` is
-  // sugar for "child of X", and the kernel makes an attached agent a child of
-  // the tree's OWNER — so naming the guest as parent is rejected outright.
-  // Omitting the flag lets the kernel resolve the real owner.
-  const fixture = harvestFixture(t, "repo", { guestOf: "owner-instance-1" });
+test("an attached guest anchors the harvester to the work-tree OWNER", async (t) => {
+  // The kernel makes an attached agent a child of the tree's owner and rejects
+  // any other relation, so a guest must name the owner it borrows from — never
+  // itself.
+  const fixture = harvestFixture(t, "repo", { workMode: "attached", guestOf: "owner-instance-1", linkWorkTo: "owner" });
   const result = await run(["harvest", "--json"], fixture.env, fixture.home);
   assert.equal(result.code, 0, result.stderr);
   const record = JSON.parse(readFileSync(fixture.record, "utf8"));
-  assert.equal(record.args.includes("--parent"), false, "a guest must not claim to own the tree it borrows");
-  assert.equal(record.args.includes("--relation"), false);
+  assert.equal(argValue(record.args, "--parent"), "owner-instance-1");
   assert.equal(argValue(record.args, "--work"), "attached");
   assert.equal(argValue(record.args, "--work-dir"), realpathSync(join(fixture.home, "work")));
-  assert.deepEqual(record.args.slice(0, 2), ["spawn", "memory-harvest"]);
-  assert.equal(argValue(record.args, "--purpose"), "source-instance-1");
 });
 
-test("a local-soul guest instance also omits parentage", async (t) => {
-  const fixture = harvestFixture(t, "local", { guestOf: "owner-instance-1" });
+test("a local-soul guest also anchors to the owner", async (t) => {
+  const fixture = harvestFixture(t, "local", { workMode: "attached", guestOf: "owner-instance-1", linkWorkTo: "owner" });
+  const result = await run(["harvest", "--json"], fixture.env, fixture.home);
+  assert.equal(result.code, 0, result.stderr);
+  const record = JSON.parse(readFileSync(fixture.record, "utf8"));
+  assert.equal(argValue(record.args, "--parent"), "owner-instance-1");
+  assert.match(record.task, /LOCAL-SOUL/);
+});
+
+test("an attached guest on a tree the kernel cannot identify still names the owner", async (t) => {
+  // No instance owns this path, so the kernel can infer nothing and DEMANDS an
+  // explicit parent. The recorded owner is the only honest answer.
+  const fixture = harvestFixture(t, "repo", { workMode: "attached", guestOf: "owner-instance-1", linkWorkTo: "repo" });
+  const result = await run(["harvest", "--json"], fixture.env, fixture.home);
+  assert.equal(result.code, 0, result.stderr);
+  const record = JSON.parse(readFileSync(fixture.record, "utf8"));
+  assert.equal(argValue(record.args, "--parent"), "owner-instance-1");
+});
+
+test("an attached guest with no recorded owner invents no lineage", async (t) => {
+  const fixture = harvestFixture(t, "repo", { workMode: "attached", linkWorkTo: "repo" });
   const result = await run(["harvest", "--json"], fixture.env, fixture.home);
   assert.equal(result.code, 0, result.stderr);
   const record = JSON.parse(readFileSync(fixture.record, "utf8"));
   assert.equal(record.args.includes("--parent"), false);
-  assert.match(record.task, /LOCAL-SOUL/);
+  assert.equal(record.args.includes("--relation"), false);
+});
+
+test("a CHECKOUT instance owns its tree even though <home>/work is a symlink", async (t) => {
+  // Checkout mode symlinks <home>/work straight at the repository. Deciding
+  // ownership from disk shape would read that as a guest and drop the parent,
+  // and the kernel would then refuse the spawn outright.
+  const fixture = harvestFixture(t, "repo", { workMode: "checkout", linkWorkTo: "repo" });
+  const result = await run(["harvest", "--json"], fixture.env, fixture.home);
+  assert.equal(result.code, 0, result.stderr);
+  const record = JSON.parse(readFileSync(fixture.record, "utf8"));
+  assert.equal(argValue(record.args, "--parent"), "source-instance-1");
+  assert.equal(argValue(record.args, "--work"), "attached");
 });
 
 test("harvest propagates schema-v1 spawn errors and still removes the task file", async (t) => {

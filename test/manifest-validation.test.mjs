@@ -69,10 +69,15 @@ function runFixture(t, mutate = () => {}) {
   };
   const templates = { "config-templates/default/oas-config.yaml": VALID_TEMPLATE };
 
-  mutate({ packageManifest, capabilityManifest, templates, fixture, payload, capabilityDir });
+  // A mutation may return { packageJson, capabilityJson } to write RAW bytes
+  // instead of the serialized object — the only way to express a manifest that
+  // is valid JSON but not a JSON object.
+  const raw = mutate({ packageManifest, capabilityManifest, templates, fixture, payload, capabilityDir }) || {};
 
-  if (packageManifest !== null) writeFileSync(join(payload, "oas-package.json"), JSON.stringify(packageManifest, null, 2) + "\n");
-  if (capabilityManifest !== null) writeFileSync(join(capabilityDir, "oas.json"), JSON.stringify(capabilityManifest, null, 2) + "\n");
+  writeFileSync(join(payload, "oas-package.json"),
+    raw.packageJson !== undefined ? raw.packageJson : JSON.stringify(packageManifest, null, 2) + "\n");
+  writeFileSync(join(capabilityDir, "oas.json"),
+    raw.capabilityJson !== undefined ? raw.capabilityJson : JSON.stringify(capabilityManifest, null, 2) + "\n");
   for (const [rel, body] of Object.entries(templates)) {
     const path = join(payload, rel);
     mkdirSync(dirname(path), { recursive: true });
@@ -97,6 +102,29 @@ test("the baseline fixture passes the gate", (t) => {
   const result = runFixture(t);
   assert.equal(result.status, 0, result.stderr);
   assert.match(result.stdout, /1 capability manifest\(s\) and 1 config template\(s\)/);
+});
+
+test("gate rejects a non-object package manifest root", (t) => {
+  // null, scalars and arrays are all valid JSON. Treating them as "nothing left
+  // to check" let an empty manifest pass the gate while the released loader
+  // rejects them outright.
+  for (const [label, body] of [["null", "null"], ["number", "42"], ["string", '"nope"'], ["array", "[]"]]) {
+    const result = runFixture(t, () => ({ packageJson: body + "\n" }));
+    assert.equal(result.status, 1, `${label} root must fail (stdout: ${result.stdout})`);
+    assert.match(result.stderr, new RegExp(`oas-package\\.json: must be a JSON object \\(got ${label}\\)`));
+  }
+});
+
+test("gate rejects a non-object capability manifest root", (t) => {
+  const result = runFixture(t, () => ({ capabilityJson: "null\n" }));
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /oas\.json: must be a JSON object \(got null\)/);
+});
+
+test("gate rejects an unparseable manifest", (t) => {
+  const result = runFixture(t, () => ({ packageJson: "{ not json\n" }));
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /invalid JSON/);
 });
 
 test("gate rejects a package that exports no capability", (t) => {

@@ -16,6 +16,7 @@
 // binary whose `oas version` is not 0.20.0, because a probe against the wrong
 // kernel proves nothing.
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
@@ -68,9 +69,15 @@ if (!cli) {
   sh("npm", ["install", `@oas-framework/oas@${REQUIRED_KERNEL}`, "--no-audit", "--no-fund", "--loglevel", "error"], { cwd: prefix });
   cli = join(prefix, "node_modules", ".bin", "oas");
 }
-const kernelVersion = sh(cli, ["version"]).stdout.trim();
-check(`released CLI is @oas-framework/oas@${REQUIRED_KERNEL}`, kernelVersion.includes(REQUIRED_KERNEL), `got ${JSON.stringify(kernelVersion)}`);
-if (!kernelVersion.includes(REQUIRED_KERNEL)) { process.stderr.write("refusing to probe against a non-0.20.0 kernel\n"); process.exit(1); }
+// EXACT version, from the structured envelope — a substring match on the human
+// line would accept 10.20.0 or 0.20.0-dev, and OAS_PROBE_CLI can point anywhere.
+const versionRun = sh(cli, ["version", "--json"], { allowFailure: true });
+let kernelVersion = null;
+try { kernelVersion = JSON.parse(versionRun.stdout).version; } catch { /* reported by the check */ }
+check(`released CLI is exactly @oas-framework/oas@${REQUIRED_KERNEL}`,
+  versionRun.status === 0 && kernelVersion === REQUIRED_KERNEL,
+  `got ${JSON.stringify(kernelVersion ?? versionRun.stdout.trim())}`);
+if (kernelVersion !== REQUIRED_KERNEL) { process.stderr.write(`refusing to probe against kernel ${kernelVersion ?? "(unreadable)"} — this probe asserts the ${REQUIRED_KERNEL} contract\n`); process.exit(1); }
 const oas = (args, opts = {}) => sh(cli, args, opts);
 
 // ---------- publish the payload as a git package source ----------
@@ -103,8 +110,11 @@ git(scopeA, "config", "user.email", "probe@example.invalid");
 git(scopeA, "config", "user.name", "oas.okf consumer probe");
 
 section("Acquisition and flat materialization");
-const install = oas(["install", sourceSpec, "--dir", scopeA, "--no-requirements", "--json"]);
-check("`oas install <git source>` succeeds", install.status === 0, install.stderr);
+// allowFailure so the assertion can actually FAIL: without it sh() exits the
+// process on a nonzero status and `status === 0` could only ever be true.
+const install = oas(["install", sourceSpec, "--dir", scopeA, "--no-requirements", "--json"], { allowFailure: true });
+check("`oas install <git source>` succeeds", install.status === 0, install.stderr || install.stdout);
+if (install.status !== 0) { process.stderr.write("\nacquisition failed — the remaining checks have nothing to inspect\n"); process.exit(1); }
 
 const lockPath = join(scopeA, "oas-lock.json");
 const lock = existsSync(lockPath) ? JSON.parse(readFileSync(lockPath, "utf8")) : {};
@@ -127,11 +137,13 @@ check("acquisition grants NO executable trust", capabilityRow.trusted === false,
 const installedDir = join(scopeA, ".agents", "capabilities", "installed", "oas.okf");
 check("capability materialized at .agents/capabilities/installed/oas.okf", existsSync(installedDir));
 
-/** Every file under `dir`, plus any symlink it contains. A materialized
- * artifact must be a plain tree: the kernel resolves symlinks away so the
- * installed directory is independently hashable. */
-function walk(dir) {
+/** Every file under `dir` with its CONTENT digest, plus any symlink it
+ * contains. Names alone prove nothing: a materializer or restore that kept the
+ * filenames and changed the bytes would satisfy a filename comparison while
+ * shipping something other than the authored payload. */
+function snapshot(dir) {
   const files = [];
+  const digests = new Map();
   const symlinks = [];
   const recurse = (current) => {
     for (const entry of readdirSync(current, { withFileTypes: true })) {
@@ -140,14 +152,17 @@ function walk(dir) {
       if (entry.isSymbolicLink()) { symlinks.push(rel); continue; }
       if (entry.isDirectory()) { recurse(path); continue; }
       files.push(rel);
+      digests.set(rel, createHash("sha256").update(readFileSync(path)).digest("hex"));
     }
   };
   if (existsSync(dir)) recurse(dir);
-  return { files: files.sort(), symlinks: symlinks.sort() };
+  return { files: files.sort(), digests, symlinks: symlinks.sort() };
 }
+/** rels present in both, with identical bytes. */
+const sameBytes = (a, b, rels) => rels.every((rel) => a.digests.get(rel) !== undefined && a.digests.get(rel) === b.digests.get(rel));
 
-const materialized = walk(installedDir);
-const authored = walk(capabilityRoot);
+const materialized = snapshot(installedDir);
+const authored = snapshot(capabilityRoot);
 check("materialized artifact is FLAT — it contains no symlinks", materialized.symlinks.length === 0, materialized.symlinks.join(", "));
 // The kernel writes exactly one file of its own into the artifact: the
 // `.oas-installation.json` provenance record. Anything else appearing here
@@ -156,6 +171,9 @@ const PROVENANCE = ".oas-installation.json";
 check("materialized artifact is the authored capability plus only the kernel's provenance record",
   JSON.stringify(materialized.files) === JSON.stringify([...authored.files, PROVENANCE].sort()),
   `installed=${materialized.files.join(",")} authored=${authored.files.join(",")}`);
+check("every authored file is byte-identical in the materialized artifact",
+  authored.files.length > 0 && sameBytes(authored, materialized, authored.files),
+  authored.files.filter((rel) => authored.digests.get(rel) !== materialized.digests.get(rel)).join(", ") || "no authored files found");
 const provenance = existsSync(join(installedDir, PROVENANCE)) ? JSON.parse(readFileSync(join(installedDir, PROVENANCE), "utf8")) : {};
 check("the provenance record names this capability, package, commit and dedicated root",
   provenance.capability === "oas.okf" && provenance.version === "2.0.0"
@@ -203,10 +221,13 @@ check("the artifact is gone before restore", !existsSync(installedDir));
 const restore = oas(["install", "--dir", scopeA, "--no-requirements", "--json"], { allowFailure: true });
 check("bare `oas install` restores from the lock", restore.status === 0, restore.stderr);
 check("the artifact is re-materialized", existsSync(installedDir));
-const restored = walk(installedDir);
+const restored = snapshot(installedDir);
 check("restore reproduces the same file set",
   JSON.stringify(restored.files) === JSON.stringify(materialized.files),
   `restored=${restored.files.length} original=${materialized.files.length}`);
+check("restore reproduces the artifact BYTE-for-byte, provenance record included",
+  materialized.files.length > 0 && sameBytes(materialized, restored, materialized.files),
+  materialized.files.filter((rel) => materialized.digests.get(rel) !== restored.digests.get(rel)).join(", ") || "nothing materialized to compare");
 check("restore is EXACT — the lock is byte-identical", readFileSync(lockPath, "utf8") === lockBeforeRestore);
 const lockAfterRestore = JSON.parse(readFileSync(lockPath, "utf8"));
 check("restore advances neither source, version nor commit",
@@ -294,7 +315,7 @@ if (orphanWarning) {
 
 // ---------- verdict ----------
 section("Result");
-process.stdout.write(`  kernel     ${kernelVersion}\n`);
+process.stdout.write(`  kernel     @oas-framework/oas@${kernelVersion}\n`);
 process.stdout.write(`  source     ${sourceUrl}@probe-v2.0.0#oas-package\n`);
 process.stdout.write(`  commit     ${sourceCommit}\n`);
 process.stdout.write(`  package    ${packageRow.integrity}\n`);
