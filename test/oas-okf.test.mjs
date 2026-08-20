@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -62,7 +62,7 @@ console.log(JSON.stringify({ schemaVersion: 1, ok: true, result: {
   return bin;
 }
 
-function harvestFixture(t, mode, { model, errorCode } = {}) {
+function harvestFixture(t, mode, { model, errorCode, guestOf } = {}) {
   const scope = tempDir(t);
   const root = join(scope, "agents");
   const home = join(root, "source", "instances", "source-instance-1");
@@ -70,7 +70,13 @@ function harvestFixture(t, mode, { model, errorCode } = {}) {
   const work = join(home, "work");
   mkdirSync(join(home, "notes"), { recursive: true });
   mkdirSync(context, { recursive: true });
-  mkdirSync(work, { recursive: true });
+  if (guestOf) {
+    // Attached work mode: <home>/work is a LINK into another instance's tree,
+    // which that instance — not this one — owns.
+    const ownerWork = join(root, "source", "instances", guestOf, "work");
+    mkdirSync(ownerWork, { recursive: true });
+    symlinkSync(ownerWork, work);
+  } else mkdirSync(work, { recursive: true });
   writeFileSync(join(home, "notes", "pending.md"), "---\ntype: Lesson\n---\n\nPending.\n");
 
   let soul = join(home, "soul");
@@ -251,6 +257,32 @@ test("repo-resident harvest builds an attached same-tree spawn", async (t) => {
   assert.match(record.task, /ATTACHED to the instance's work tree/);
   assert.equal(record.taskMode, 0o600);
   assert.equal(existsSync(record.taskFile), false);
+});
+
+test("an attached guest instance claims no parentage it does not have", async (t) => {
+  // The source instance shares another instance's work tree. `--parent` is
+  // sugar for "child of X", and the kernel makes an attached agent a child of
+  // the tree's OWNER — so naming the guest as parent is rejected outright.
+  // Omitting the flag lets the kernel resolve the real owner.
+  const fixture = harvestFixture(t, "repo", { guestOf: "owner-instance-1" });
+  const result = await run(["harvest", "--json"], fixture.env, fixture.home);
+  assert.equal(result.code, 0, result.stderr);
+  const record = JSON.parse(readFileSync(fixture.record, "utf8"));
+  assert.equal(record.args.includes("--parent"), false, "a guest must not claim to own the tree it borrows");
+  assert.equal(record.args.includes("--relation"), false);
+  assert.equal(argValue(record.args, "--work"), "attached");
+  assert.equal(argValue(record.args, "--work-dir"), realpathSync(join(fixture.home, "work")));
+  assert.deepEqual(record.args.slice(0, 2), ["spawn", "memory-harvest"]);
+  assert.equal(argValue(record.args, "--purpose"), "source-instance-1");
+});
+
+test("a local-soul guest instance also omits parentage", async (t) => {
+  const fixture = harvestFixture(t, "local", { guestOf: "owner-instance-1" });
+  const result = await run(["harvest", "--json"], fixture.env, fixture.home);
+  assert.equal(result.code, 0, result.stderr);
+  const record = JSON.parse(readFileSync(fixture.record, "utf8"));
+  assert.equal(record.args.includes("--parent"), false);
+  assert.match(record.task, /LOCAL-SOUL/);
 });
 
 test("harvest propagates schema-v1 spawn errors and still removes the task file", async (t) => {

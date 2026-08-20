@@ -105,11 +105,26 @@ async function spawnHarvester(spawnArgs, task) {
 }
 
 function harvestSpawnArgs({ slug, parent, repo, work, workDir, branch, model }) {
-  const args = ["--purpose", slug, "--parent", parent, "--repo", repo, "--work", work];
+  const args = ["--purpose", slug];
+  // `--parent` is sugar for `--relation child --relative-to <instance>`. An
+  // ATTACHED spawn is always a child of the work-tree OWNER, and the kernel
+  // rejects a parent that names anyone else — so a source instance that is
+  // itself a guest on someone else's tree must not claim parentage it does not
+  // have. Omitting the flag lets the kernel resolve the true owner.
+  if (parent) args.push("--parent", parent);
+  args.push("--repo", repo, "--work", work);
   if (workDir) args.push("--work-dir", workDir);
   if (branch) args.push("--branch", branch);
   args.push("--model", model);
   return args;
+}
+
+/** True when `<home>/work` is this instance's OWN tree rather than a link into
+ * another instance's (attached work mode). Compared through realpath on both
+ * sides, since the home itself may be reached through a symlink. */
+function ownsWorkTree(home, workDir) {
+  try { return workDir === join(realpathSync(home), "work"); }
+  catch { return false; }
 }
 
 /** Append a one-line entry to an OKF log.md (newest-first, date-grouped per spec §7). */
@@ -258,6 +273,11 @@ _(the single next action — keep this current; a fresh session on any model res
     // resolved-config read crosses the public package boundary.
     const harvestModel = settings["harvest-model"] || DEFAULT_HARVEST_MODEL;
     const workDir = realpathSync(join(home, "work"));
+    // Attached harvests inherit the source instance's tree. When the source
+    // OWNS that tree it is the harvester's parent; when the source is itself an
+    // attached guest, the tree belongs to another instance and only the kernel
+    // can name it (see harvestSpawnArgs).
+    const attachedParent = ownsWorkTree(home, workDir) ? inst : undefined;
     const realSoul = realpathSync(sDir);
     const harvName = `memory-harvest-${slug}`;
     const gitRootOf = (start) => { let d = start; while (d !== dirname(d)) { if (existsSync(join(d, ".git"))) return d; d = dirname(d); } return undefined; };
@@ -270,7 +290,7 @@ _(the single next action — keep this current; a fresh session on any model res
       // version. It must not touch the owner's work tree.
       const task = `Harvest the pending notes of live LOCAL-SOUL instance "${inst}" (agent "${agName}") into its soul — by direct edits, no commit.\n\n- Source notes: ${notesDir} (${notes.join(", ")})\n- Soul knowledge bundle to update: ${join(realSoul, "knowledge")}\n- Soul skills dir (for procedure-shaped notes): ${join(realSoul, "skills")}\n- This soul is LOCAL (uncommitted, gitignored): edit those soul files IN PLACE. Do NOT run git commit — not for the soul, and not in ./work (the shared tree belongs to the working instance; leave it untouched).\n- Follow your memory-harvest skill for everything else: promote/merge/drop each note, knowledge vs skill routing, index + log discipline, validate the bundle, DELETE processed notes from the source notes/ dir.\n- Then run \`oas retire ${harvName} --self\`.`;
       r = await spawnHarvester(harvestSpawnArgs({
-        slug, parent: inst, repo: context, work: "attached", workDir, model: harvestModel,
+        slug, parent: attachedParent, repo: context, work: "attached", workDir, model: harvestModel,
       }), task);
     } else if ((process.env.OAS_WORK || meta.work) === "workspace") {
       // WORKSPACE-MODE instance: ./work is the whole workspace, not a git repo —
@@ -294,7 +314,7 @@ _(the single next action — keep this current; a fresh session on any model res
         : realSoul;
       const task = `Harvest the pending notes of live instance "${inst}" (agent "${agName}") into its soul.\n\n- Source notes: ${notesDir} (${notes.join(", ")})\n- Soul knowledge bundle to update: ${join(soulTarget, "knowledge")}\n- Soul skills dir (for procedure-shaped notes): ${join(soulTarget, "skills")}\n- You are ATTACHED to the instance's work tree (./work) — commit your promotions there as a single commit, prefixed "memory-harvest:".\n- Follow your memory-harvest skill: promote/merge/drop each note, knowledge vs skill routing, index + log discipline, validate the bundle, DELETE processed notes from the source notes/ dir (so they are not re-harvested), commit, then run \`oas retire ${harvName} --self\`.`;
       r = await spawnHarvester(harvestSpawnArgs({
-        slug, parent: inst, repo: context, work: "attached", workDir, model: harvestModel,
+        slug, parent: attachedParent, repo: context, work: "attached", workDir, model: harvestModel,
       }), task);
     }
     if (JSON_MODE) jsonOk({ harvest: "spawned", instance: r.instance, window: r.tmux?.window || null });
