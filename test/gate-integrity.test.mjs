@@ -146,7 +146,7 @@ for (const [label, bypass] of [
 test("an unknown script name alone is a violation, whatever it runs", () => {
   // The outermost defense: even a perfectly innocent extra script fails, so no
   // new spelling has to be anticipated.
-  assert.deepEqual(Object.keys({ ...scripts, "test:bypass": "node --test" }).sort(), 
+  assert.deepEqual(Object.keys({ ...scripts, "test:bypass": "node --test" }).sort(),
     [...Object.keys(canonicalScripts()), "test:bypass"].sort());
   assert.notDeepEqual(Object.keys({ ...scripts, "test:bypass": "node --test" }).sort(), Object.keys(canonicalScripts()).sort());
 });

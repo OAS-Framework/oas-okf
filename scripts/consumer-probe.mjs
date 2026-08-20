@@ -15,7 +15,7 @@
 // an existing released `oas` binary to skip that download; the probe refuses a
 // binary whose `oas version` is not 0.20.0, because a probe against the wrong
 // kernel proves nothing.
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -133,25 +133,46 @@ const isolatedEnv = {
  * which is not the system under test and legitimately needs the host registry
  * configuration. Every kernel invocation stays isolated. */
 function sh(command, args, { cwd = probeRoot, env = {}, allowFailure = false, isolated = true } = {}) {
-  try {
-    const stdout = execFileSync(command, args, {
-      cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
-      env: isolated
-        ? { ...isolatedEnv, ...env }
-        : { ...process.env, OAS_NO_LAUNCH: "1", GIT_TERMINAL_PROMPT: "0", ...env },
-    });
-    return { status: 0, stdout, stderr: "" };
-  } catch (error) {
-    if (!allowFailure) {
-      process.stderr.write(`\nprobe command failed: ${command} ${args.join(" ")}\n${error.stdout || ""}\n${error.stderr || ""}\n`);
-      process.exit(1);
-    }
-    return { status: error.status ?? 1, stdout: error.stdout || "", stderr: error.stderr || "" };
+  // spawnSync, not execFileSync: execFileSync only surfaces stderr on THROW, so
+  // a successful command's stderr was unavailable and any comparison of it was
+  // vacuously equal. spawnSync captures all three streams on every outcome.
+  const result = spawnSync(command, args, {
+    cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+    env: isolated
+      ? { ...isolatedEnv, ...env }
+      : { ...process.env, OAS_NO_LAUNCH: "1", GIT_TERMINAL_PROMPT: "0", ...env },
+  });
+  const stdout = result.stdout ?? "";
+  // A spawn failure (ENOENT for a missing binary, a signal) has no exit status;
+  // report it as a failure with the reason on stderr rather than as success.
+  const stderr = result.error ? `${result.stderr ?? ""}${result.error.message}` : (result.stderr ?? "");
+  const status = result.status ?? (result.error || result.signal ? 1 : 0);
+  if (status !== 0 && !allowFailure) {
+    process.stderr.write(`\nprobe command failed: ${command} ${args.join(" ")}\n${stdout}\n${stderr}\n`);
+    process.exit(1);
   }
+  return { status, stdout, stderr };
 }
 const git = (cwd, ...args) => sh("git", args, { cwd });
 // `git check-ignore` exits 1 to mean "not ignored" — a normal answer, not a failure.
 const gitIgnores = (cwd, path) => sh("git", ["check-ignore", "-q", path], { cwd, allowFailure: true }).status === 0;
+
+// ---------- harness self-check ----------
+// Every stderr comparison below is only as good as the harness's ability to
+// capture stderr from a command that SUCCEEDS. execFileSync surfaces stderr
+// only when it throws, which silently made such comparisons vacuous. Pin it.
+section("Harness");
+const stderrOnSuccess = sh(join(probeBin, "node"),
+  ["-e", "console.error('harness-stderr-check'); console.log('ok'); process.exit(0)"], { allowFailure: true });
+check("the harness captures stderr from a SUCCESSFUL command",
+  stderrOnSuccess.status === 0
+  && /harness-stderr-check/.test(stderrOnSuccess.stderr)
+  && /ok/.test(stderrOnSuccess.stdout),
+  `status=${stderrOnSuccess.status} stderr=${JSON.stringify(stderrOnSuccess.stderr)}`);
+const spawnFailure = sh(join(probeBin, "definitely-absent-binary"), [], { allowFailure: true });
+check("a spawn failure is reported as a failure, not as silent success",
+  spawnFailure.status !== 0 && spawnFailure.stderr.length > 0,
+  `status=${spawnFailure.status} stderr=${JSON.stringify(spawnFailure.stderr).slice(0, 120)}`);
 
 // ---------- released kernel ----------
 section("Released kernel");
