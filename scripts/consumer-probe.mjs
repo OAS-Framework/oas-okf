@@ -143,10 +143,20 @@ function sh(command, args, { cwd = probeRoot, env = {}, allowFailure = false, is
       : { ...process.env, OAS_NO_LAUNCH: "1", GIT_TERMINAL_PROMPT: "0", ...env },
   });
   const stdout = result.stdout ?? "";
-  // A spawn failure (ENOENT for a missing binary, a signal) has no exit status;
-  // report it as a failure with the reason on stderr rather than as success.
-  const stderr = result.error ? `${result.stderr ?? ""}${result.error.message}` : (result.stderr ?? "");
-  const status = result.status ?? (result.error || result.signal ? 1 : 0);
+  // A child with no exit status failed, and the helper's contract is that every
+  // such failure carries its REASON on stderr. The two no-status shapes differ:
+  // a spawn that never started sets `error` (ENOENT), while one killed by a
+  // signal sets `signal` and usually no `error` at all — and may have written
+  // nothing, which would otherwise surface as an opaque `{ status: 1,
+  // stderr: "" }`. Both reasons are appended explicitly.
+  const reasons = [];
+  if (result.error) reasons.push(result.error.message);
+  if (result.signal) reasons.push(`terminated by signal ${result.signal}`);
+  const captured = result.stderr ?? "";
+  const stderr = reasons.length
+    ? `${captured}${captured && !captured.endsWith("\n") ? "\n" : ""}${reasons.join("; ")}`
+    : captured;
+  const status = result.status ?? (reasons.length ? 1 : 0);
   if (status !== 0 && !allowFailure) {
     process.stderr.write(`\nprobe command failed: ${command} ${args.join(" ")}\n${stdout}\n${stderr}\n`);
     process.exit(1);
@@ -170,9 +180,16 @@ check("the harness captures stderr from a SUCCESSFUL command",
   && /ok/.test(stderrOnSuccess.stdout),
   `status=${stderrOnSuccess.status} stderr=${JSON.stringify(stderrOnSuccess.stderr)}`);
 const spawnFailure = sh(join(probeBin, "definitely-absent-binary"), [], { allowFailure: true });
-check("a spawn failure is reported as a failure, not as silent success",
+check("a spawn that never starts is reported as a failure carrying its reason",
   spawnFailure.status !== 0 && spawnFailure.stderr.length > 0,
   `status=${spawnFailure.status} stderr=${JSON.stringify(spawnFailure.stderr).slice(0, 120)}`);
+// The other no-status shape: killed by a signal, with `signal` set, no `error`,
+// and nothing written. Without an explicit reason this is an opaque failure.
+const signalled = sh(join(probeBin, "node"),
+  ["-e", "process.kill(process.pid, 'SIGKILL')"], { allowFailure: true });
+check("a signal-terminated command is reported as a failure naming the signal",
+  signalled.status !== 0 && /terminated by signal SIGKILL/.test(signalled.stderr),
+  `status=${signalled.status} signal-reason=${JSON.stringify(signalled.stderr).slice(0, 120)}`);
 
 // ---------- released kernel ----------
 section("Released kernel");
