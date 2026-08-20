@@ -50,13 +50,18 @@ process.on("exit", () => { if (!keep) rmSync(probeRoot, { recursive: true, force
 // call site in the packed 0.20.0 `lib/` + `bin/` (execFileSync, execFile,
 // execSync, spawnSync, spawn):
 //
-//   PATH-resolved, legitimate for this probe's command set:
+//   PATH-resolved and NEEDED by the command set this probe exercises:
 //     git    clone/checkout/worktree/rev-parse for git package sources
 //     npm    `npm ci` for a capability runtime closure; `npm view` on update
 //     node   CLI shebang, and capability command dispatch (spawnSync("node"))
-//     cp     `cp -R` for a local standalone-capability copy (core.mjs:942)
 //
-//   PATH-resolved, must never be reached here — launch/runtime paths only:
+//   PATH-resolved and NOT needed here, so poisoned rather than linked. Being
+//   part of the kernel's surface is not a reason to make one reachable: the
+//   test is whether THIS probe's operations require it. `cp` is the instructive
+//   case — it is real kernel surface, but only for LOCAL standalone-capability
+//   acquisition, and this probe acquires from a git source. Linking it would
+//   silently permit an accidental new call.
+//     cp      `cp -R` for a local standalone-capability copy (core.mjs:942)
 //     pi      runtime launch, and `pi list --no-approve`
 //     claude  runtime launch, and `claude plugin list`
 //     tmux    session/window creation, and tmux-config reload
@@ -87,8 +92,8 @@ const probeTmp = join(probeRoot, "tmp");
 const witness = join(probeRoot, "ambient-executions.log");
 for (const dir of [probeBin, probeHome, probeTmp]) mkdirSync(dir, { recursive: true });
 
-const REQUIRED_TOOLS = ["node", "git", "npm", "cp"];
-const FORBIDDEN_TOOLS = ["pi", "claude", "tmux", "brew", "acli", "codex"];
+const REQUIRED_TOOLS = ["node", "git", "npm"];
+const FORBIDDEN_TOOLS = ["pi", "claude", "tmux", "brew", "cp", "acli", "codex"];
 const hostPathDirs = (process.env.PATH || "").split(":").filter(Boolean);
 const findOnHostPath = (bin) => hostPathDirs.map((d) => join(d, bin)).find((p) => existsSync(p));
 for (const tool of REQUIRED_TOOLS) {
@@ -414,8 +419,16 @@ function deleteAndRestore() {
     // probe root); only the poisoned/absent stubs differ, and they appear
     // nowhere in doctor's output. So this is compared verbatim.
     doctorJson: doctor.stdout,
+    doctorStderr: doctor.stderr,
+    doctorParsed: (() => { try { return JSON.parse(doctor.stdout); } catch { return undefined; } })(),
   };
 }
+/** A doctor observation only counts if it IS one: two identical failures with
+ * empty stdout would otherwise compare equal and prove nothing. */
+const doctorIsMeaningful = (run) =>
+  run.doctorStatus === 0
+  && typeof run.doctorJson === "string" && run.doctorJson.trim().length > 0
+  && !!run.doctorParsed && typeof run.doctorParsed === "object";
 rmSync(witness, { force: true });
 const poisonedRun = deleteAndRestore();
 const witnessAfterPoisoned = existsSync(witness) ? readFileSync(witness, "utf8").trim() : "";
@@ -434,9 +447,18 @@ check("both restores produce the same artifact, byte for byte",
   `poisoned=${poisonedRun.artifact.files.length} absent=${absentRun.artifact.files.length}`);
 check("both restores leave a byte-identical lock", poisonedRun.lock === absentRun.lock);
 check("the lock still matches the pre-isolation restore", absentRun.lock === lockBeforeRestore);
+check("both doctor runs actually succeeded and returned a parseable envelope",
+  doctorIsMeaningful(poisonedRun) && doctorIsMeaningful(absentRun),
+  `poisoned status=${poisonedRun.doctorStatus} bytes=${poisonedRun.doctorJson.length} parsed=${!!poisonedRun.doctorParsed}; ` +
+  `absent status=${absentRun.doctorStatus} bytes=${absentRun.doctorJson.length} parsed=${!!absentRun.doctorParsed}`);
+check("the doctor envelope describes THIS scope's installed capability",
+  JSON.stringify(poisonedRun.doctorParsed ?? {}).includes("oas.okf"),
+  JSON.stringify(poisonedRun.doctorParsed ?? {}).slice(0, 200));
 check("doctor reports identically with the runtimes POISONED and ABSENT",
-  poisonedRun.doctorStatus === absentRun.doctorStatus && poisonedRun.doctorJson === absentRun.doctorJson,
-  `status ${poisonedRun.doctorStatus}/${absentRun.doctorStatus}; json equal: ${poisonedRun.doctorJson === absentRun.doctorJson}`);
+  poisonedRun.doctorStatus === absentRun.doctorStatus
+  && poisonedRun.doctorJson === absentRun.doctorJson
+  && poisonedRun.doctorStderr === absentRun.doctorStderr,
+  `status ${poisonedRun.doctorStatus}/${absentRun.doctorStatus}; stdout equal: ${poisonedRun.doctorJson === absentRun.doctorJson}; stderr equal: ${poisonedRun.doctorStderr === absentRun.doctorStderr}`);
 
 section("Released-kernel diagnostics recorded, not worked around");
 // Maintainer ruling (final-v2 wave): the released 0.20.0 doctor emits an

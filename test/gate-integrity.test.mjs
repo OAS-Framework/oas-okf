@@ -4,134 +4,158 @@
 // OAS deployment this repository root also holds
 // `agents/<soul>/instances/<id>/work/` — full checkouts of this same repository
 // belonging to running agent instances — so discovery reaches their `test/`
-// directories and the suite the gate reports becomes a function of which agents
-// happen to be alive on that machine. A green run then proves nothing
-// reproducible, and a stale worktree can fail the gate for code nobody ships.
+// directories and the reported suite becomes a function of which agents happen
+// to be alive on that machine.
 //
-// Detecting that by pattern-matching `node --test` is not enough: `node
-// --no-warnings --test` is the same hazard and does not match. So these tests
-// tokenize every script and enforce a CANONICAL RUNNER — exactly one Node
-// test-runner invocation exists in package.json, it lives in one known script,
-// and its file list is exactly the contents of `test/`. Any second invocation,
-// however spelled, fails.
+// Two earlier versions of this guard tried to DESCRIBE the hazard — first
+// `node --test` as an adjacency, then a tokenizer looking for `--test` in the
+// option vector. Both were bypassable, because there is no end to the ways a
+// shell can spell "run node": `FOO=1 node --test`, `env FOO=1 node --test`,
+// `(node --test)`, `npx node --test`, `$NODE --test`, `"node" --test`, and
+// Node 22's own `node --test=foo`.
+//
+// So this guard does not describe the hazard. It FAILS CLOSED: package.json's
+// scripts must be exactly the known set, spelled exactly the known way, using
+// only a tiny permitted grammar. Anything else — an unknown script, unsupported
+// shell syntax, a second runner however spelled — is a violation by default,
+// with no pattern to slip past.
 import assert from "node:assert/strict";
 import { readdirSync, readFileSync } from "node:fs";
-import { basename, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const ROOT = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const scripts = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf8")).scripts || {};
-const CANONICAL_RUNNER_SCRIPT = "test:unit";
+const RUNNER_SCRIPT = "test:unit";
 
-/** Split a script into command segments on shell operators, then into tokens.
- * Deliberately simple: this repository's scripts are plain `a && b` chains, and
- * anything more exotic should fail the "one canonical runner" rule anyway. */
-const segments = (command) =>
-  String(command).split(/&&|\|\||;|\|/).map((part) => part.trim()).filter(Boolean)
-    .map((part) => part.split(/\s+/).filter(Boolean));
+const expectedFiles = () =>
+  readdirSync(join(ROOT, "test")).filter((f) => f.endsWith(".test.mjs")).map((f) => `test/${f}`).sort();
 
-/** Every Node test-runner invocation in package.json, wherever it appears and
- * however its flags are ordered. `--test` anywhere in Node's option vector is a
- * runner — `node --no-warnings --test` counts. */
-function runnerInvocations(from = scripts) {
+/** The only scripts this repository may declare, and their exact spelling. */
+const canonicalScripts = () => ({
+  validate: "node scripts/validate-manifests.mjs",
+  [RUNNER_SCRIPT]: `node --test ${expectedFiles().join(" ")}`,
+  probe: "node scripts/consumer-probe.mjs",
+  test: "npm run validate && npm run test:unit",
+});
+
+// Conservative: ordinary path/flag characters and spaces only. Anything that can
+// introduce a command — quotes, parens, $, backticks, ;, |, redirection, globs —
+// is unsupported syntax, not something to parse.
+const SAFE_CHARS = /^[A-Za-z0-9_@:./=-]+$/;
+
+/** Fail-closed structural check over a scripts map. Returns human-readable
+ * violations; an empty array means the map is in the permitted grammar. */
+export function violations(map) {
   const found = [];
-  for (const [script, command] of Object.entries(from)) {
-    for (const tokens of segments(command)) {
+  const known = new Set(Object.keys(map));
+  for (const [name, raw] of Object.entries(map)) {
+    const command = String(raw);
+    if (command.includes("&&&") || /(^|[^&])&($|[^&])/.test(command)) {
+      found.push(`${name}: backgrounding or malformed '&'`);
+      continue;
+    }
+    for (const segment of command.split("&&")) {
+      const tokens = segment.trim().split(/\s+/).filter(Boolean);
+      if (!tokens.length) { found.push(`${name}: empty command segment`); continue; }
+      for (const token of tokens) {
+        if (!SAFE_CHARS.test(token)) { found.push(`${name}: unsupported shell syntax in "${token}"`); }
+      }
       const [bin, ...rest] = tokens;
-      if (basename(bin || "") !== "node") continue;
-      if (!rest.includes("--test")) continue;
-      found.push({ script, tokens, args: rest.filter((t) => t !== "--test") });
+      // The executable must be a bare `npm` or `node` — never an env
+      // assignment, a wrapper, a variable, or a quoted spelling.
+      if (bin !== "npm" && bin !== "node") {
+        found.push(`${name}: segment must start with npm or node, got "${bin}"`);
+        continue;
+      }
+      // `--test` in ANY form, including `--test=<x>`, may appear only in the one
+      // canonical runner script.
+      const carriesRunner = rest.some((t) => t === "--test" || t.startsWith("--test="));
+      if (carriesRunner && name !== RUNNER_SCRIPT) {
+        found.push(`${name}: only "${RUNNER_SCRIPT}" may invoke the Node test runner`);
+      }
+      if (bin === "npm") {
+        if (rest[0] !== "run" || rest.length !== 2) found.push(`${name}: npm segments must be exactly "npm run <script>"`);
+        else if (!known.has(rest[1])) found.push(`${name}: runs unknown script "${rest[1]}"`);
+      } else if (carriesRunner) {
+        if (!rest.includes("--test")) found.push(`${name}: runner must use "--test", not "--test=<x>"`);
+        const files = rest.filter((t) => t !== "--test");
+        if (!files.length) found.push(`${name}: bare \`node --test\` — recursive discovery`);
+        for (const f of files) {
+          if (!f.startsWith("test/") || !f.endsWith(".test.mjs")) found.push(`${name}: runner argument "${f}" is not a test/*.test.mjs file`);
+        }
+      } else if (rest.length !== 1 || !rest[0].endsWith(".mjs")) {
+        found.push(`${name}: node segments must name exactly one .mjs script`);
+      }
     }
   }
   return found;
 }
 
-const expectedFiles = () =>
-  readdirSync(join(ROOT, "test")).filter((f) => f.endsWith(".test.mjs")).map((f) => `test/${f}`).sort();
-
-test("exactly one Node test-runner invocation exists, in the canonical script", () => {
-  const runners = runnerInvocations();
-  assert.equal(runners.length, 1,
-    `expected exactly one \`node ... --test\` invocation; found ${runners.length}: ${runners.map((r) => `${r.script}: ${r.tokens.join(" ")}`).join(" | ")}`);
-  assert.equal(runners[0].script, CANONICAL_RUNNER_SCRIPT,
-    `the runner must live in "${CANONICAL_RUNNER_SCRIPT}", found it in "${runners[0].script}"`);
+test("package.json declares exactly the known scripts", () => {
+  assert.deepEqual(Object.keys(scripts).sort(), Object.keys(canonicalScripts()).sort(),
+    "an unknown script is a violation by default — this is what makes the guard fail closed");
 });
 
-test("the canonical runner names explicit files — no bare discovery, no dirs, no globs", () => {
-  const [runner] = runnerInvocations();
-  assert.ok(runner, "no runner found");
-  const files = runner.args.filter((token) => !token.startsWith("-"));
-  assert.ok(files.length > 0, `runner takes no file arguments — bare discovery: ${runner.tokens.join(" ")}`);
-  for (const token of files) {
-    assert.ok(token.endsWith(".test.mjs"), `runner argument "${token}" is not a .test.mjs file`);
-    assert.ok(!/[*?\[\]]/.test(token), `runner argument "${token}" is a glob — globs re-open recursive discovery`);
-    assert.ok(token.startsWith("test/"), `runner argument "${token}" is outside test/`);
-  }
+test("every script is spelled exactly the canonical way", () => {
+  assert.deepEqual(scripts, canonicalScripts());
 });
 
-test("the canonical runner's file list is exactly the contents of test/", () => {
+test("the runner's file list is exactly the contents of test/", () => {
   // Closes the failure an explicit list CREATES: a suite that exists but never
-  // runs. Compared against this one runner, never a union across scripts — a
-  // union lets a safe runner mask an unsafe one.
-  const [runner] = runnerInvocations();
-  assert.ok(runner, "no runner found");
-  const named = [...new Set(runner.args.filter((token) => !token.startsWith("-")))].sort();
-  assert.deepEqual(named, expectedFiles(),
-    "every file in test/ must be named by the canonical runner, and every named file must exist");
+  // runs. Derived from disk, so a new test file fails the gate until registered.
+  const named = (scripts[RUNNER_SCRIPT] || "").split(/\s+/).filter((t) => t.endsWith(".test.mjs")).sort();
+  assert.deepEqual(named, expectedFiles());
 });
 
-test("the aggregate gate delegates to the canonical runner", () => {
-  assert.ok(scripts.test, "package.json needs a `test` script");
-  const inAggregate = runnerInvocations().filter((r) => r.script === "test");
-  assert.equal(inAggregate.length, 0,
-    "`test` must delegate to the canonical runner so the file list lives in ONE place");
-  assert.match(scripts.test, /npm run validate/, "`test` must run the manifest gate");
-  assert.match(scripts.test, new RegExp(`npm run ${CANONICAL_RUNNER_SCRIPT}`), "`test` must run the unit suite");
+test("the real manifest is inside the permitted grammar", () => {
+  assert.deepEqual(violations(scripts), []);
 });
 
 // --- mutation cases -------------------------------------------------------
-// The detector is the load-bearing part, so exercise it directly against
-// synthetic script maps rather than mutating package.json on disk. Each case is
-// a real bypass that a naive `\bnode\s+--test\b` match would let through.
-const SAFE = "node --test test/a.test.mjs";
-for (const [label, command, expected] of [
-  ["flags before --test (bare)", `npm run test:unit && node --no-warnings --test`, 1],
-  ["flags between node and --test, with files", `node --no-warnings --test test/a.test.mjs`, 1],
-  ["appended bare runner", `${SAFE} && node --test`, 2],
-  ["bare runner in an earlier segment", `node --test && ${SAFE}`, 2],
-  ["semicolon-separated second runner", `${SAFE} ; node --test`, 2],
-  ["piped second runner", `${SAFE} | node --test`, 2],
-  ["absolute node path", `/usr/local/bin/node --test`, 1],
-  ["single safe runner", SAFE, 1],
+// Every spelling that defeated the previous tokenizer, plus the forms that
+// defeated the one before it. Exercised against the checker directly, so they
+// stay fast and leave package.json untouched.
+const BASE = { validate: "node scripts/validate-manifests.mjs", [RUNNER_SCRIPT]: "node --test test/a.test.mjs", probe: "node scripts/consumer-probe.mjs", test: "npm run validate && npm run test:unit" };
+for (const [label, bypass] of [
+  ["env assignment prefix", "FOO=1 node --test"],
+  ["env wrapper", "env FOO=1 node --test"],
+  ["subshell parentheses", "(node --test)"],
+  ["--test= form", "node --test=foo"],
+  ["npx wrapper", "npx node --test"],
+  ["quoted executable", '"node" --test'],
+  ["variable executable", "$NODE --test"],
+  ["command substitution", "$(which node) --test"],
+  ["semicolon chain", "node scripts/validate-manifests.mjs ; node --test"],
+  ["pipe chain", "node scripts/validate-manifests.mjs | node --test"],
+  ["backgrounded", "node --test &"],
+  ["plain bare runner", "node --test"],
+  ["absolute node path", "/usr/local/bin/node --test"],
 ]) {
-  test(`runner detection: ${label}`, () => {
-    const found = runnerInvocations({ "test:unit": command });
-    assert.equal(found.length, expected, `detected ${found.length} runner(s) in: ${command}`);
+  test(`rejected as an extra script: ${label}`, () => {
+    const problems = violations({ ...BASE, "test:bypass": bypass });
+    assert.ok(problems.length > 0, `"${bypass}" produced no violation`);
+  });
+  test(`rejected when appended to the aggregate: ${label}`, () => {
+    const problems = violations({ ...BASE, test: `npm run validate && npm run test:unit && ${bypass}` });
+    assert.ok(problems.length > 0, `"${bypass}" produced no violation when chained into \`test\``);
   });
 }
 
-test("a runner hidden behind Node flags is detected AND seen as bare", () => {
-  // The reported bypass: `node --no-warnings --test` appended to the aggregate.
-  // An adjacency match misses it entirely; the detector must both see it and
-  // report that it names no files.
-  const found = runnerInvocations({ test: "npm run validate && npm run test:unit && node --no-warnings --test" });
-  assert.equal(found.length, 1);
-  assert.deepEqual(found[0].args.filter((a) => !a.startsWith("-")), [], "it names no files — bare discovery");
-  assert.equal(found[0].script, "test", "it lives outside the canonical runner script");
+test("an unknown script name alone is a violation, whatever it runs", () => {
+  // The outermost defense: even a perfectly innocent extra script fails, so no
+  // new spelling has to be anticipated.
+  assert.deepEqual(Object.keys({ ...scripts, "test:bypass": "node --test" }).sort(), 
+    [...Object.keys(canonicalScripts()), "test:bypass"].sort());
+  assert.notDeepEqual(Object.keys({ ...scripts, "test:bypass": "node --test" }).sort(), Object.keys(canonicalScripts()).sort());
 });
 
-test("runner detection ignores non-node commands that mention --test", () => {
-  assert.equal(runnerInvocations({ x: "npm run test:unit --test" }).length, 0);
-  assert.equal(runnerInvocations({ x: "echo --test" }).length, 0);
+test("a compliant runner cannot mask a second one", () => {
+  const problems = violations({ ...BASE, test: "npm run validate && npm run test:unit && node --test" });
+  assert.ok(problems.some((p) => /bare|only "test:unit"/.test(p)), problems.join("; "));
 });
 
-test("a second runner in ANY script is rejected, not masked by the safe one", () => {
-  // The union bug: collecting file names across every script let a compliant
-  // `test:unit` satisfy the equality check while another script ran bare
-  // discovery. The count rule is per-package.json, so it cannot be masked.
-  const found = runnerInvocations({ "test:unit": SAFE, "test:extra": "node --test" });
-  assert.equal(found.length, 2);
-  assert.ok(found.some((r) => r.args.filter((a) => !a.startsWith("-")).length === 0),
-    "the bare invocation must be visible in the detected set");
+test("the permitted grammar still accepts the canonical manifest shape", () => {
+  assert.deepEqual(violations(BASE), []);
 });
