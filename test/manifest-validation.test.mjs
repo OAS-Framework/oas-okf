@@ -37,6 +37,7 @@ function runFixture(t, mutate = () => {}) {
   mkdirSync(join(capabilityDir, "bin"), { recursive: true });
   mkdirSync(join(capabilityDir, "skills", "fixture"), { recursive: true });
   mkdirSync(join(capabilityDir, "injects"), { recursive: true });
+  mkdirSync(join(capabilityDir, "agents", "fixture-agent"), { recursive: true });
   mkdirSync(join(payload, "config-templates", "default"), { recursive: true });
   copyFileSync(join(ROOT, "scripts", "validate-manifests.mjs"), join(fixture, "scripts", "validate-manifests.mjs"));
   for (const schema of SCHEMAS) copyFileSync(join(ROOT, "schemas", schema), join(fixture, "schemas", schema));
@@ -44,6 +45,8 @@ function runFixture(t, mutate = () => {}) {
   writeFileSync(join(capabilityDir, "bin", "fixture.mjs"), "#!/usr/bin/env node\n");
   writeFileSync(join(capabilityDir, "skills", "fixture", "SKILL.md"), "# fixture skill\n");
   writeFileSync(join(capabilityDir, "injects", "fixture.md"), "fixture injection\n");
+  writeFileSync(join(capabilityDir, "agents", "fixture-agent", "soul.yaml"), "name: fixture-agent\nkind: capability\n");
+  writeFileSync(join(capabilityDir, "agents", "fixture-agent", "AGENTS.md"), "# fixture agent\n");
   // A package-only file: reachable from the package root but NOT from the
   // capability root, so a capability that reaches it is not self-contained.
   writeFileSync(join(payload, "PACKAGE-ONLY.md"), "package-level file\n");
@@ -64,6 +67,7 @@ function runFixture(t, mutate = () => {}) {
     description: "Negative manifest-validation fixture capability.",
     requires: [],
     skills: ["skills"],
+    agents: ["agents/fixture-agent"],
     inject: "injects/fixture.md",
     commands: { run: "bin/fixture.mjs run" },
   };
@@ -265,6 +269,37 @@ test("gate rejects a declared skill tree containing a broken symlink", (t) => {
   });
   assert.equal(result.status, 1);
   assert.match(result.stderr, /skill tree "skills" contains a broken symlink/);
+});
+
+// Released 0.20 self-containment is ASYMMETRIC, and collapsing the two kinds
+// into one "walk it if it is a directory" rule is exactly how a generic
+// validator drifts: `agents[]` entries MUST be directories, while `skills[]`
+// entries are merely walked when they happen to be one.
+test("gate rejects an agents[] entry that is not a directory", (t) => {
+  const result = runFixture(t, ({ capabilityManifest, capabilityDir }) => {
+    writeFileSync(join(capabilityDir, "agents", "a-file-agent"), "not a directory\n");
+    capabilityManifest.agents = ["agents/a-file-agent"];
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /capability-defined agent "agents\/a-file-agent" is not a directory/);
+});
+
+test("gate ACCEPTS a skills[] entry that is a file", (t) => {
+  // The control for the case above: demanding directories for skills too would
+  // be the mirror-image parity break, and the kernel accepts a plain file here.
+  const result = runFixture(t, ({ capabilityManifest, capabilityDir }) => {
+    writeFileSync(join(capabilityDir, "a-single-skill.md"), "# a skill that is one file\n");
+    capabilityManifest.skills = ["a-single-skill.md"];
+  });
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test("gate walks an agents[] directory for escaping descendants", (t) => {
+  const result = runFixture(t, ({ capabilityDir, payload }) => {
+    symlinkSync(join(payload, "PACKAGE-ONLY.md"), join(capabilityDir, "agents", "fixture-agent", "reaches-out.md"));
+  });
+  assert.equal(result.status, 1, result.stdout);
+  assert.match(result.stderr, /capability-defined agent "agents\/fixture-agent" contains a path escaping the capability root/);
 });
 
 test("gate rejects a command entrypoint outside the capability root", (t) => {
