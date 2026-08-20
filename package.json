@@ -7,8 +7,9 @@
   "private": true,
   "scripts": {
     "validate": "node scripts/validate-manifests.mjs",
+    "test:unit": "node --test test/gate-integrity.test.mjs test/manifest-validation.test.mjs test/oas-okf.test.mjs",
     "probe": "node scripts/consumer-probe.mjs",
-    "test": "npm run validate && node --test"
+    "test": "npm run validate && npm run test:unit"
   },
   "repository": {
     "type": "git",
