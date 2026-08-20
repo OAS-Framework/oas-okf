@@ -105,11 +105,42 @@ async function spawnHarvester(spawnArgs, task) {
 }
 
 function harvestSpawnArgs({ slug, parent, repo, work, workDir, branch, model }) {
-  const args = ["--purpose", slug, "--parent", parent, "--repo", repo, "--work", work];
+  const args = ["--purpose", slug];
+  // `--parent` is sugar for `--relation child --relative-to <instance>`. An
+  // ATTACHED spawn is always a child of the work-tree OWNER, and the kernel
+  // rejects a parent that names anyone else — so a source instance that is
+  // itself a guest on someone else's tree must not claim parentage it does not
+  // have. Omitting the flag lets the kernel resolve the true owner.
+  if (parent) args.push("--parent", parent);
+  args.push("--repo", repo, "--work", work);
   if (workDir) args.push("--work-dir", workDir);
   if (branch) args.push("--branch", branch);
   args.push("--model", model);
   return args;
+}
+
+/** Who the harvester must be anchored to for an ATTACHED spawn.
+ *
+ * The kernel makes an attached agent a child of the WORK-TREE OWNER, so the
+ * anchor is decided by the source instance's recorded WORK MODE, never by the
+ * shape of `<home>/work` on disk — checkout mode symlinks that path to the
+ * repository, and workspace mode to the team scope, so "is it a symlink" says
+ * nothing about ownership.
+ *
+ * - source in ATTACHED mode: it is a guest; the tree belongs to the instance the
+ *   kernel recorded as its parent. Naming that owner is accepted for a tree the
+ *   kernel can already identify, and REQUIRED for one it cannot (a tree that is
+ *   no instance's `<home>/work` has no inferable owner).
+ * - any other mode: the source owns its tree and is the anchor itself.
+ *
+ * Returns `undefined` only when an attached source has no recorded owner — then
+ * omitting the flag lets the kernel infer a known owner, and fail explicitly if
+ * it cannot, rather than inventing a lineage. */
+function attachedAnchor(inst, meta) {
+  const mode = process.env.OAS_WORK || meta.work || "";
+  if (mode !== "attached") return inst;
+  const owner = meta.parentInstance;
+  return owner && String(owner).trim() ? owner : undefined;
 }
 
 /** Append a one-line entry to an OKF log.md (newest-first, date-grouped per spec §7). */
@@ -258,6 +289,10 @@ _(the single next action — keep this current; a fresh session on any model res
     // resolved-config read crosses the public package boundary.
     const harvestModel = settings["harvest-model"] || DEFAULT_HARVEST_MODEL;
     const workDir = realpathSync(join(home, "work"));
+    // Attached harvests inherit the source instance's tree, so the harvester is
+    // a child of that tree's owner — which is the source itself unless the
+    // source is an attached guest (see attachedAnchor).
+    const attachedParent = attachedAnchor(inst, meta);
     const realSoul = realpathSync(sDir);
     const harvName = `memory-harvest-${slug}`;
     const gitRootOf = (start) => { let d = start; while (d !== dirname(d)) { if (existsSync(join(d, ".git"))) return d; d = dirname(d); } return undefined; };
@@ -270,7 +305,7 @@ _(the single next action — keep this current; a fresh session on any model res
       // version. It must not touch the owner's work tree.
       const task = `Harvest the pending notes of live LOCAL-SOUL instance "${inst}" (agent "${agName}") into its soul — by direct edits, no commit.\n\n- Source notes: ${notesDir} (${notes.join(", ")})\n- Soul knowledge bundle to update: ${join(realSoul, "knowledge")}\n- Soul skills dir (for procedure-shaped notes): ${join(realSoul, "skills")}\n- This soul is LOCAL (uncommitted, gitignored): edit those soul files IN PLACE. Do NOT run git commit — not for the soul, and not in ./work (the shared tree belongs to the working instance; leave it untouched).\n- Follow your memory-harvest skill for everything else: promote/merge/drop each note, knowledge vs skill routing, index + log discipline, validate the bundle, DELETE processed notes from the source notes/ dir.\n- Then run \`oas retire ${harvName} --self\`.`;
       r = await spawnHarvester(harvestSpawnArgs({
-        slug, parent: inst, repo: context, work: "attached", workDir, model: harvestModel,
+        slug, parent: attachedParent, repo: context, work: "attached", workDir, model: harvestModel,
       }), task);
     } else if ((process.env.OAS_WORK || meta.work) === "workspace") {
       // WORKSPACE-MODE instance: ./work is the whole workspace, not a git repo —
@@ -294,7 +329,7 @@ _(the single next action — keep this current; a fresh session on any model res
         : realSoul;
       const task = `Harvest the pending notes of live instance "${inst}" (agent "${agName}") into its soul.\n\n- Source notes: ${notesDir} (${notes.join(", ")})\n- Soul knowledge bundle to update: ${join(soulTarget, "knowledge")}\n- Soul skills dir (for procedure-shaped notes): ${join(soulTarget, "skills")}\n- You are ATTACHED to the instance's work tree (./work) — commit your promotions there as a single commit, prefixed "memory-harvest:".\n- Follow your memory-harvest skill: promote/merge/drop each note, knowledge vs skill routing, index + log discipline, validate the bundle, DELETE processed notes from the source notes/ dir (so they are not re-harvested), commit, then run \`oas retire ${harvName} --self\`.`;
       r = await spawnHarvester(harvestSpawnArgs({
-        slug, parent: inst, repo: context, work: "attached", workDir, model: harvestModel,
+        slug, parent: attachedParent, repo: context, work: "attached", workDir, model: harvestModel,
       }), task);
     }
     if (JSON_MODE) jsonOk({ harvest: "spawned", instance: r.instance, window: r.tmux?.window || null });

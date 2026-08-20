@@ -1,0 +1,42 @@
+# Reference configuration shipped by the oas.okf package.
+#
+# It is SOURCE MATERIAL, not installed policy: `oas install oas.okf`
+# materializes the capability and applies nothing from this file. Adoption is
+# always explicit and always separate:
+#
+#   oas init --package oas.okf     # new scope — writes this as ./oas-config.yaml
+#   oas config adopt oas.okf       # rebase an existing scope onto this template
+#
+# Adoption also records the exact bytes below as the adopted base under
+# .agents/config-templates/adopted/oas.okf/default/, which `oas config diff` and
+# `oas config sync` compare against. Commit that base with your config.
+#
+# Everything here becomes ordinary local policy the moment it is adopted. Rename
+# the deployment, retarget or disable the layer, or replace the provider — a
+# package update never rewrites an adopted config.
+
+name: okf-deployment
+
+capabilities:
+  layers:
+    # oas.okf is this package's knowledge-layer provider. `from: installed`
+    # requires the materialized artifact under
+    # .agents/capabilities/installed/oas.okf/, so the binding resolves only to
+    # the locked package payload — never to an ambient host path.
+    #
+    # Acquisition does not trust it. Approve its commands and hooks explicitly
+    # with `oas trust oas.okf` before spawning instances.
+    knowledge:
+      capability: oas.okf
+      from: installed
+      # Every soul at this scope gets the OKF knowledge layer. Narrow it with
+      # `oas use oas.okf --type <agent-type>` or `--soul <soul>` instead when
+      # only some agent families should carry it.
+      global: true
+      # Optional per-family settings, e.g. the model the harvester runs on:
+      #   settings:
+      #     harvest-model: gpt-5.5
+
+# The messaging and tasks layers are deliberately absent: oas.okf supplies
+# neither, and writing `none` here would suppress a provider an outer scope may
+# legitimately bind. Add them when you choose their providers.

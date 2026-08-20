@@ -10,28 +10,50 @@ Official [OAS](https://github.com/OAS-Framework/oas) knowledge-layer integration
 
 ## Requirements
 
-The capability has no external host-command requirement. It requires OAS `>=0.19.0`, whose frozen package-runtime boundary provides schema-v1 `oas spawn ... --json` envelopes and capability-defined agents.
+The capability has no external host-command requirement. It requires OAS `>=0.20.0`, the release whose materialization contract projects each exported capability into a self-contained `.agents/capabilities/installed/<id>/` artifact and whose frozen package-runtime boundary provides schema-v1 `oas spawn ... --json` envelopes and capability-defined agents.
 
 The harvest command invokes only that structured CLI boundary through the absolute `OAS_CLI_BIN` supplied by dispatch and argv-safe `execFile`. It never searches `PATH`, discovers the kernel root, or imports private kernel files. [`KERNEL-API-NEEDS.md`](KERNEL-API-NEEDS.md) records the now-satisfied historical inventory.
 
-## Acquire and activate
+## What the package ships
 
-Acquisition does not activate the capability. After a release tag and catalog entry exist, install, trust the executable surface, and activate it deliberately:
+```text
+oas-package/                                     # the distributed payload, and only it
+  oas-package.json                               # package 2.0.0, compatibility >=0.20.0
+  capabilities/oas-okf/                          # the DEDICATED capability root
+    oas.json  agents/  bin/  injects/  skills/   # everything the capability declares
+  config-templates/default/oas-config.yaml       # a reference config; never applied by install
+  LICENSE
+```
+
+The capability root is dedicated and self-contained: every declared skill, injection, agent, command, and hook resolves inside it, with no symlinks and no reach into package-only paths. That is what lets the kernel hash, restore, and trust the installed artifact on its own.
+
+## Acquire, trust, and activate
+
+Installing materializes the capability. It grants no trust and applies no config:
 
 ```bash
-oas install oas.okf --dir /path/to/scope
-oas trust oas.okf --dir /path/to/scope
-oas use oas.okf --global --dir /path/to/scope
+oas install oas.okf --dir /path/to/scope          # after the catalog entry exists
+oas trust oas.okf --dir /path/to/scope            # approve the executable surface
+oas use oas.okf --global --dir /path/to/scope     # activate it deliberately
 oas doctor /path/to/scope --soul <soul-name>
 ```
 
-A pinned Git source may be used before catalog publication:
+A pinned Git source works before catalog publication:
 
 ```bash
-oas install git:https://github.com/OAS-Framework/oas-okf.git@v1.4.1 --dir /path/to/scope
+oas install git:https://github.com/OAS-Framework/oas-okf.git@<tag> --dir /path/to/scope
 ```
 
-Do not publish that tag yet: the released-0.19.0 consumer probe gate remains open.
+## Adopting the config template
+
+`config-templates/default/oas-config.yaml` is a complete reference configuration that binds `oas.okf` to the knowledge layer. It is package **source material**, not installed policy — `oas install` applies none of it. Adoption is always explicit and always separate:
+
+```bash
+oas init --package oas.okf --config default --dir /path/to/scope   # new scope
+oas config adopt oas.okf --config default --dir /path/to/scope     # rebase an existing scope
+```
+
+Adoption also records the exact template bytes as the adopted base under `.agents/config-templates/adopted/oas.okf/default/`, which `oas config diff` and `oas config sync` compare against. Commit that base with your config. Everything adopted becomes ordinary local policy: retarget the layer, disable it, or replace the provider — a package update never rewrites an adopted config.
 
 ## Use
 
@@ -46,9 +68,12 @@ The command skips safely when there are no pending notes or when a harvester for
 ## Development
 
 ```bash
-npm test
+npm test     # manifest gate + unit tests
+npm run probe   # isolated consumer probe against the released 0.20.0 CLI
 ```
 
-This validates `oas-package.json` and the enumerated `oas.json`, checks package-relative resource containment, and exercises the standalone lifecycle behavior. The full acquire → lock → trust → activate → spawn probe is documented in [`SCHEMA-STATUS.md`](SCHEMA-STATUS.md) and remains pending released OAS 0.19.0 consumer fixtures.
+`npm test` runs [`scripts/validate-manifests.mjs`](scripts/validate-manifests.mjs), the repository gate that mirrors the released 0.20.0 package contract — dedicated capability roots, per-capability self-containment, the canonical `configTemplates` spelling and location, template portability and config validity, and the compatibility floor — then the unit tests for that gate and for the capability's own lifecycle behavior.
 
-Release and checksum conventions are defined by the official-package staging convention in the source staging branch.
+`npm run probe` runs [`scripts/consumer-probe.mjs`](scripts/consumer-probe.mjs), which installs the released `@oas-framework/oas@0.20.0` into a scratch prefix, publishes this payload as a pinned Git source, and proves through the real CLI, outside this source tree: git acquisition with a contained package root, flat materialization, transport-only package lock rows, per-artifact capability lock rows, no trust at acquisition, generated-store ignore behavior, the separate trust gate, exact restore, explicit template adoption with a recorded adopted base, and composition into a soul's final `AGENTS.md`. Set `OAS_PROBE_CLI` to an existing released binary to skip the download; the probe refuses any kernel that is not 0.20.0.
+
+Both gates run in CI on every pull request. [`SCHEMA-STATUS.md`](SCHEMA-STATUS.md) records the vendored-schema provenance and the probe's standing.
