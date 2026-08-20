@@ -17,7 +17,7 @@
 // kernel proves nothing.
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -39,12 +39,79 @@ const section = (title) => process.stdout.write(`\n${title}\n`);
 const probeRoot = mkdtempSync(join(tmpdir(), "oas-okf-consumer-probe-"));
 process.on("exit", () => { if (!keep) rmSync(probeRoot, { recursive: true, force: true }); });
 
-function sh(command, args, { cwd = probeRoot, env = {}, allowFailure = false } = {}) {
+// ---------- host isolation ----------
+// The system under test is the RELEASED KERNEL, and it resolves executables and
+// config from the environment. Inheriting the developer's PATH and HOME makes a
+// green run depend on what that machine happens to have installed — the probe
+// would "prove" behavior it never controlled. So every kernel invocation runs
+// with a synthetic PATH, HOME and TMPDIR.
+//
+// The kernel's external-executable surface (released 0.20.0, lib/ + bin/):
+//   git    clone/checkout of git package sources          — REQUIRED here
+//   npm    `npm ci` for a capability runtime closure      — REQUIRED (unused: oas.okf ships none)
+//   node   shebang resolution for the CLI itself          — REQUIRED
+//   pi     runtime launch, and `pi list` integration      — must never be reached
+//   claude runtime launch                                 — must never be reached
+//   tmux   window creation on launch                      — must never be reached
+//   plus `which(<cmd>)` per capability `requires[]` entry — oas.okf declares []
+//
+// Required tools are linked in from the real PATH. Everything else is replaced
+// by a stub that FAILS LOUDLY and records itself, so "the probe passed" also
+// means "the kernel reached no ambient binary" instead of merely "this laptop
+// had pi installed and nothing noticed".
+const probeBin = join(probeRoot, "bin");
+const probeHome = join(probeRoot, "home");
+const probeTmp = join(probeRoot, "tmp");
+const witness = join(probeRoot, "ambient-executions.log");
+for (const dir of [probeBin, probeHome, probeTmp]) mkdirSync(dir, { recursive: true });
+
+const REQUIRED_TOOLS = ["node", "git", "npm"];
+const FORBIDDEN_TOOLS = ["pi", "claude", "tmux", "acli", "codex"];
+const hostPathDirs = (process.env.PATH || "").split(":").filter(Boolean);
+const findOnHostPath = (bin) => hostPathDirs.map((d) => join(d, bin)).find((p) => existsSync(p));
+for (const tool of REQUIRED_TOOLS) {
+  const real = findOnHostPath(tool);
+  if (!real) { process.stderr.write(`the probe needs ${tool} on PATH\n`); process.exit(1); }
+  symlinkSync(real, join(probeBin, tool));
+}
+/** Write the fail-loud stubs. Kept callable so the absent-direction check can
+ * remove and restore them. */
+function plantForbiddenStubs() {
+  for (const tool of FORBIDDEN_TOOLS) {
+    const stub = join(probeBin, tool);
+    if (existsSync(stub)) continue;
+    writeFileSync(stub, `#!/bin/sh
+printf '%s %s\n' "${tool}" "$*" >> ${JSON.stringify(witness)}
+printf 'PROBE VIOLATION: the kernel invoked ambient "${tool}"\n' >&2
+exit 97
+`);
+    chmodSync(stub, 0o755);
+  }
+}
+const removeForbiddenStubs = () => { for (const tool of FORBIDDEN_TOOLS) rmSync(join(probeBin, tool), { force: true }); };
+plantForbiddenStubs();
+
+const isolatedEnv = {
+  PATH: probeBin,
+  HOME: probeHome,
+  TMPDIR: probeTmp,
+  // The developer's git identity and hooks must not reach the kernel's clones.
+  GIT_CONFIG_GLOBAL: "/dev/null",
+  GIT_CONFIG_SYSTEM: "/dev/null",
+  GIT_TERMINAL_PROMPT: "0",
+  OAS_NO_LAUNCH: "1",
+};
+
+/** `isolated: false` is for PROBE SETUP only (fetching the kernel from npm),
+ * which is not the system under test and legitimately needs the host registry
+ * configuration. Every kernel invocation stays isolated. */
+function sh(command, args, { cwd = probeRoot, env = {}, allowFailure = false, isolated = true } = {}) {
   try {
     const stdout = execFileSync(command, args, {
       cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
-      // A probe must not inherit this machine's OAS state, editor, or pager.
-      env: { ...process.env, OAS_NO_LAUNCH: "1", GIT_TERMINAL_PROMPT: "0", ...env },
+      env: isolated
+        ? { ...isolatedEnv, ...env }
+        : { ...process.env, OAS_NO_LAUNCH: "1", GIT_TERMINAL_PROMPT: "0", ...env },
     });
     return { status: 0, stdout, stderr: "" };
   } catch (error) {
@@ -66,7 +133,7 @@ if (!cli) {
   const prefix = join(probeRoot, "kernel");
   mkdirSync(prefix, { recursive: true });
   writeFileSync(join(prefix, "package.json"), JSON.stringify({ name: "oas-okf-probe-host", private: true, version: "0.0.0" }) + "\n");
-  sh("npm", ["install", `@oas-framework/oas@${REQUIRED_KERNEL}`, "--no-audit", "--no-fund", "--loglevel", "error"], { cwd: prefix });
+  sh("npm", ["install", `@oas-framework/oas@${REQUIRED_KERNEL}`, "--no-audit", "--no-fund", "--loglevel", "error"], { cwd: prefix, isolated: false });
   cli = join(prefix, "node_modules", ".bin", "oas");
 }
 // EXACT version, from the structured envelope — a substring match on the human
@@ -287,6 +354,46 @@ const scaffoldedSoul = join(scopeB, "agents", "okf-probe", "soul", "knowledge", 
 check("the soul-scaffold hook produced an OKF bundle in the soul",
   existsSync(scaffoldedSoul) && /okf_version: "0\.1"/.test(readFileSync(scaffoldedSoul, "utf8")),
   scaffoldedSoul);
+
+section("Host isolation — the kernel reached nothing ambient");
+// Direction 1: the forbidden binaries EXIST on PATH throughout the run, but are
+// poisoned. Everything above therefore ran with pi/claude/tmux resolvable, and
+// a green result means the kernel never invoked them — not that this machine
+// lacked them.
+const ambient = existsSync(witness) ? readFileSync(witness, "utf8").trim() : "";
+check("no ambient runtime or multiplexer binary was invoked at any point",
+  ambient === "", ambient);
+check("the kernel ran against a synthetic PATH containing only our tools",
+  readdirSync(probeBin).sort().join(",") === [...REQUIRED_TOOLS, ...FORBIDDEN_TOOLS].sort().join(","),
+  readdirSync(probeBin).sort().join(","));
+check("the kernel ran against a synthetic HOME, not the developer's",
+  isolatedEnv.HOME === probeHome && isolatedEnv.HOME !== (process.env.HOME || ""),
+  isolatedEnv.HOME);
+// oas.okf declares `requires: []`, so the kernel's `which(<cmd>)` requirement
+// scan has nothing to resolve. Prove that rather than assuming it: a host
+// requirement would otherwise show up as a doctor warning that silently depends
+// on the developer's PATH.
+const installedManifestAtScope = JSON.parse(readFileSync(join(installedDir, "oas.json"), "utf8"));
+check("the capability declares no host requirement, so no PATH lookup can influence the result",
+  Array.isArray(installedManifestAtScope.requires) && installedManifestAtScope.requires.length === 0,
+  JSON.stringify(installedManifestAtScope.requires));
+
+// Direction 2: the forbidden binaries do NOT EXIST at all. If any command
+// silently tolerated a missing runtime differently from a present one, the two
+// directions would disagree.
+removeForbiddenStubs();
+const doctorPoisonFree = oas(["doctor", scopeA, "--json"], { allowFailure: true });
+const restorePoisonFree = oas(["install", "--dir", scopeA, "--no-requirements", "--json"], { allowFailure: true });
+const lockPoisonFree = readFileSync(lockPath, "utf8");
+check("with the runtimes ABSENT, doctor still resolves the scope",
+  doctorPoisonFree.status === doctorBefore.status,
+  `absent=${doctorPoisonFree.status} present=${doctorBefore.status}`);
+check("with the runtimes ABSENT, restore still succeeds and the lock is unchanged",
+  restorePoisonFree.status === 0 && lockPoisonFree === lockBeforeRestore,
+  restorePoisonFree.stderr || "lock drifted");
+check("no ambient binary was invoked in the absent direction either",
+  (existsSync(witness) ? readFileSync(witness, "utf8").trim() : "") === "");
+plantForbiddenStubs();
 
 section("Released-kernel diagnostics recorded, not worked around");
 // Maintainer ruling (final-v2 wave): the released 0.20.0 doctor emits an
